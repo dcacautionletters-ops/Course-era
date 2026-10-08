@@ -11,7 +11,8 @@ One-time setup on your computer:
     python -m playwright install chromium
 
 Command line:
-    python pdf_downloader.py Abstract_with_certificate_links.xlsx -o certificates --limit 10
+    python pdf_downloader.py Abstract_with_certificate_links.xlsx -o certificates --range 1-50
+    python pdf_downloader.py file.xlsx --range "1-50, 80, 100-120" --sheets "I MCA Coursera Report"
 """
 import argparse
 import re
@@ -33,6 +34,25 @@ def safe(text, maxlen=80):
     s = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", str(text or "")).strip()
     s = re.sub(r"\s+", "_", s)
     return s[:maxlen].strip("._") or "untitled"
+
+
+def parse_ranges(text):
+    """'1-50, 80, 100-120'  ->  {1..50, 80, 100..120}   (both ends inclusive). Empty -> None (= all)."""
+    if text is None or not str(text).strip():
+        return None
+    nums = set()
+    cleaned = re.sub(r"\s*(?:-|\u2013|to|:)\s*", "-", str(text).strip().lower())   # '10 to 20' -> '10-20'
+    for part in re.split(r"[,\s;]+", cleaned):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)-(\d+)", part) or re.fullmatch(r"(\d+)", part)
+        if not m:
+            raise ValueError(f"Cannot understand '{part}'. Use e.g.  1-50, 80, 100-120")
+        a = int(m.group(1)); b = int(m.group(2)) if m.lastindex == 2 else a
+        if a < 1 or b < a:
+            raise ValueError(f"Bad range '{part}' (numbers start at 1 and must go upward)")
+        nums.update(range(a, b + 1))
+    return nums
 
 
 def read_jobs(workbook):
@@ -78,33 +98,101 @@ def plan_paths(jobs, out_dir):
 
 
 # ----------------------------------------------------------------------------- browser
-class ChromePrinter:
-    """Opens a link and saves it as ONE tall PDF page (no awkward page breaks)."""
+FIND_CERT_JS = """
+() => {
+  const els = [...document.querySelectorAll('img,canvas,svg,iframe,embed,object')];
+  let best = null, area = 0;
+  for (const e of els) {
+    const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    if (st.visibility === 'hidden' || st.display === 'none' || r.width < 400 || r.height < 250) continue;
+    if (e.tagName === 'IMG' && !e.complete) continue;
+    const a = r.width * r.height;
+    if (a > area) { area = a; best = e; }
+  }
+  document.querySelectorAll('[data-cert-target]').forEach(x => x.removeAttribute('data-cert-target'));
+  if (!best) return false;
+  best.setAttribute('data-cert-target', '1');
+  return true;
+}
+"""
 
-    def __init__(self, timeout_ms=60000):
+
+def _png_size(png_bytes):
+    import struct
+    return struct.unpack(">II", png_bytes[16:24])
+
+
+class ChromePrinter:
+    """
+    Opens a link and saves a PDF.
+      certificate_only=True : finds the big certificate image on the page, saves ONLY that
+                              (page size = certificate size). Falls back to the whole page
+                              if no certificate is detected, and says so in the report.
+      certificate_only=False: whole page as one tall PDF page.
+    """
+    SCALE = 3          # sharpness of the certificate image
+
+    def __init__(self, timeout_ms=60000, certificate_only=True):
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(headless=True)
-        self._ctx = self._browser.new_context(viewport={"width": 1300, "height": 900})
+        self._ctx = self._browser.new_context(viewport={"width": 1400, "height": 1000},
+                                              device_scale_factor=self.SCALE if certificate_only else 1)
         self._timeout = timeout_ms
+        self._only = certificate_only
+        self._debug_saved = 0
+
+    def _check_page(self, page, resp):
+        if resp is not None and resp.status >= 400:
+            raise RuntimeError(f"HTTP {resp.status}")
+        text = (page.inner_text("body") or "").lower()
+        if any(t in text for t in ("page not found", "doesn't exist", "does not exist",
+                                   "invalid certificate", "no longer available")):
+            raise RuntimeError("Coursera says the certificate page is not available")
+
+    def _save_certificate_only(self, page, path):
+        page.wait_for_timeout(1500)
+        if not page.evaluate(FIND_CERT_JS):
+            return False
+        png = page.locator('[data-cert-target="1"]').first.screenshot(type="png")
+        wpx, hpx = _png_size(png)
+        w, h = wpx / self.SCALE, hpx / self.SCALE
+        import base64
+        html = (f'<html><body style="margin:0"><img style="display:block;width:{w}px;height:{h}px" '
+                f'src="data:image/png;base64,{base64.b64encode(png).decode()}"></body></html>')
+        pdf_page = self._ctx.new_page()
+        try:
+            pdf_page.set_content(html)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pdf_page.pdf(path=str(path), width=f"{w}px", height=f"{h}px", print_background=True,
+                         page_ranges="1", margin=dict(top="0", bottom="0", left="0", right="0"))
+        finally:
+            pdf_page.close()
+        return True
 
     def __call__(self, url, path):
         page = self._ctx.new_page()
         try:
             resp = page.goto(url, wait_until="networkidle", timeout=self._timeout)
-            if resp is not None and resp.status >= 400:
-                raise RuntimeError(f"HTTP {resp.status}")
-            page.wait_for_timeout(1500)                       # let the certificate render
-            text = (page.inner_text("body") or "").lower()
-            if any(t in text for t in ("page not found", "doesn't exist", "does not exist",
-                                       "invalid certificate", "no longer available")):
-                raise RuntimeError("Coursera says the certificate page is not available")
+            self._check_page(page, resp)
+            if self._only and self._save_certificate_only(page, path):
+                return ""
+            note = ""
+            if self._only:
+                note = "Certificate image not detected - saved full page"
+                if self._debug_saved < 3:               # keep a copy so the detector can be tuned
+                    dbg = path.parent.parent / "_debug"
+                    dbg.mkdir(parents=True, exist_ok=True)
+                    (dbg / f"{path.stem}.html").write_text(page.content(), encoding="utf-8")
+                    self._debug_saved += 1
+            page.wait_for_timeout(500)
             height = page.evaluate("Math.max(document.body.scrollHeight, "
                                    "document.documentElement.scrollHeight)")
             page.emulate_media(media="screen")
             path.parent.mkdir(parents=True, exist_ok=True)
-            page.pdf(path=str(path), width="1300px", height=f"{min(int(height) + 20, 14000)}px",
+            page.pdf(path=str(path), width="1400px", height=f"{min(int(height) + 20, 14000)}px",
                      print_background=True, margin=dict(top="0", bottom="0", left="0", right="0"))
+            return note
         finally:
             page.close()
 
@@ -115,10 +203,11 @@ class ChromePrinter:
 
 # ----------------------------------------------------------------------------- main routine
 def download_certificates(workbook, out_dir, limit=None, delay=2.0, retries=2,
-                          progress=None, render=None):
+                          progress=None, render=None, certificate_only=True,
+                          select=None, sheets=None):
     """
     workbook : path / file-like of the linker output
-    limit    : only the first N links (use 10 for a trial run)
+    select   : which certificates, by number, e.g. '1-50' or '1-50, 80, 100-120' (None = all).\n               Numbers count the downloadable links in the chosen sheets, in sheet order (1,2,3...)\n    sheets   : list of sheet names to include (None = all sheets)\n    limit    : only the first N of the selection (use 10 for a trial run)
     delay    : seconds to wait between downloads (be polite to Coursera)
     progress : optional callback(done, total, message)
     render   : optional function(url, path) -> used instead of Chrome (for testing)
@@ -127,33 +216,39 @@ def download_certificates(workbook, out_dir, limit=None, delay=2.0, retries=2,
     out_dir = Path(out_dir)
     jobs = plan_paths(read_jobs(workbook), out_dir)
     report = []
-    todo = []
+    wanted = parse_ranges(select)
+    todo, n = [], 0
     for j in jobs:
+        if sheets is not None and j["sheet"] not in sheets:
+            continue
         if not j["url"].lower().startswith("http"):
-            report.append({**j, "status": "No link (Link not available)", "error": ""})
-        else:
+            report.append({**j, "no": "", "status": "No link (Link not available)", "error": ""})
+            continue
+        n += 1
+        j["no"] = n
+        if wanted is None or n in wanted:
             todo.append(j)
     if limit:
         todo = todo[:int(limit)]
 
-    printer = render or ChromePrinter()
+    printer = render or ChromePrinter(certificate_only=certificate_only)
     try:
         for i, j in enumerate(todo, 1):
-            row = {k: j[k] for k in ("sheet", "roll", "name", "course", "url")}
+            row = {k: j[k] for k in ("no", "sheet", "roll", "name", "course", "url")}
             row["file"] = str(j["path"])
             if j["path"].exists() and j["path"].stat().st_size > 0:
                 row.update(status="Skipped (already downloaded)", error="")
             else:
-                err = ""
+                err, note = "", ""
                 for attempt in range(retries + 1):
                     try:
-                        printer(j["url"], j["path"])
+                        note = printer(j["url"], j["path"]) or ""
                         err = ""
                         break
                     except Exception as e:                      # noqa: BLE001
                         err = str(e).splitlines()[0][:200]
                         time.sleep(delay * (attempt + 1))
-                row.update(status="Downloaded" if not err else "FAILED", error=err)
+                row.update(status="Downloaded" if not err else "FAILED", error=err or note)
                 time.sleep(delay)
             report.append(row)
             if progress:
@@ -181,10 +276,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Download Coursera certificate links as PDFs.")
     ap.add_argument("workbook")
     ap.add_argument("-o", "--out", default="certificates")
-    ap.add_argument("--limit", type=int, default=None, help="only first N links (trial run)")
+    ap.add_argument("--range", default=None, help="certificate numbers, e.g. 1-50  or  1-50,80,100-120")
+    ap.add_argument("--sheets", nargs="*", default=None, help="only these sheet names")
+    ap.add_argument("--limit", type=int, default=None, help="only first N of the selection (trial run)")
     ap.add_argument("--delay", type=float, default=2.0)
+    ap.add_argument("--full-page", action="store_true", help="save the whole page, not just the certificate")
     a = ap.parse_args()
-    rep = download_certificates(a.workbook, a.out, a.limit, a.delay,
+    rep = download_certificates(a.workbook, a.out, a.limit, a.delay, certificate_only=not a.full_page, select=a.range, sheets=a.sheets,
+                                
                                 progress=lambda d, t, m: print(f"[{d}/{t}] {m}"))
     print(rep["status"].value_counts().to_string())
     print(f"Report: {Path(a.out) / 'download_report.csv'}")
