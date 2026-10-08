@@ -8,7 +8,7 @@ from pathlib import Path
 import streamlit as st
 
 from certificate_linker import process
-from pdf_downloader import download_certificates, read_jobs, zip_folder
+from pdf_downloader import download_certificates, parse_ranges, read_jobs, zip_folder
 
 st.set_page_config(page_title="Coursera Certificate Tools", page_icon="🎓", layout="wide")
 st.title("🎓 Coursera Certificate Tools")
@@ -72,20 +72,30 @@ with tab2:
         real = sum(j["url"].lower().startswith("http") for j in jobs)
         st.write(f"**{real}** certificate links found across "
                  f"**{len({j['sheet'] for j in jobs})}** sheet(s).")
-        c1, c2 = st.columns(2)
-        limit = c1.number_input("How many to download now (start with 10 as a test; 0 = all)",
-                                min_value=0, value=10, step=10)
+        all_sheets = list(dict.fromkeys(j["sheet"] for j in jobs))
+        chosen = st.multiselect("Sheets / semesters", all_sheets, default=all_sheets)
+        n_sel = sum(j["url"].lower().startswith("http") for j in jobs if j["sheet"] in chosen)
+        c1, c2 = st.columns([2, 1])
+        rng = c1.text_input(f"Certificate numbers (1 to {n_sel}) - e.g.  1-50   or   1-50, 80, 100-120   (blank = all)",
+                            value="1-10")
         delay = c2.slider("Pause between downloads (seconds)", 1.0, 10.0, 2.0, 0.5)
+        try:
+            picked = parse_ranges(rng)
+            count = n_sel if picked is None else len([x for x in picked if x <= n_sel])
+            st.caption(f"➡️ {count} certificate(s) will be downloaded. Next batch tip: use {min(n_sel, (max(picked) if picked else 0) + 1)}-{min(n_sel, (max(picked) if picked else 0) + 50)}.")
+        except ValueError as e:
+            st.error(str(e)); picked = False
+        cert_only = st.checkbox("Certificate only (crop out the rest of the page)", value=True)
         st.warning("Large runs take long (about 5-10 s per certificate). For all ~1,000, use "
                    "`python pdf_downloader.py file.xlsx` on your own computer; this tab is best for test batches.")
 
-        if st.button("Download PDFs", type="primary"):
+        if st.button("Download PDFs", type="primary", disabled=(picked is False or not chosen)):
             try:
                 ensure_browser()
                 tmp = Path(tempfile.mkdtemp()) / "certificates"
                 bar, msg = st.progress(0.0), st.empty()
                 rep = download_certificates(
-                    io.BytesIO(src.getvalue()), tmp, limit=limit or None, delay=delay,
+                    io.BytesIO(src.getvalue()), tmp, select=rng, sheets=chosen, delay=delay, certificate_only=cert_only,
                     progress=lambda d, t, m: (bar.progress(d / max(t, 1)), msg.write(f"{d}/{t}  {m}")))
                 bar.progress(1.0)
                 st.session_state["pdf_report"] = rep
@@ -99,8 +109,11 @@ with tab2:
         st.write(rep["status"].value_counts().to_frame("count"))
         st.download_button("⬇️ Download ZIP of PDFs", st.session_state["pdf_zip"],
                            file_name="certificates.zip", mime="application/zip")
+        full = rep[rep["error"].astype(str).str.contains("not detected", na=False)]
+        if len(full):
+            st.warning(f"{len(full)} file(s) could not be cropped to the certificate and were saved as full pages.")
         bad = rep[rep["status"].str.contains("FAILED|No link", na=False)]
         if len(bad):
             st.subheader("Not downloaded")
-            st.dataframe(bad[["sheet", "roll", "name", "course", "status", "error"]],
+            st.dataframe(bad[["no", "sheet", "roll", "name", "course", "status", "error"]],
                          use_container_width=True, hide_index=True)
